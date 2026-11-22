@@ -21,8 +21,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build Docker image
         run: docker build -t llm-caching-proxy .
-      - name: Check that the container starts
+      - name: Send requests through the container
         run: |
-          docker run -d --name proxy -p 8080:8080 llm-caching-proxy
+          # Fake Ollama on the runner, proxy in Docker, then the same request twice
+          python3 -c "import sys, time; sys.path.insert(0, 'tests'); from mock_ollama import MockOllama; MockOllama(delay=0); time.sleep(300)" &
+          docker run -d --name proxy --network host -e UPSTREAM=127.0.0.1:11434 llm-caching-proxy
           sleep 2
           docker logs proxy | grep "LLM caching proxy on :8080"
+          BODY='{"model":"llama3","prompt":"docker test","stream":false}'
+          curl -si http://localhost:8080/api/generate -d "$BODY" | tee first.txt
+          curl -si http://localhost:8080/api/generate -d "$BODY" | tee second.txt
+          grep -q "X-Cache: MISS" first.txt
+          grep -q "X-Cache: HIT" second.txt
+          grep -q "docker test" second.txt
