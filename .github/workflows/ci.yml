@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: gcc -O2 -Wall -Wextra -pthread -o proxy main.c
+      - name: Run tests
+        run: python3 tests/test_proxy.py
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t llm-caching-proxy .
+      - name: Check that the container starts
+        run: |
+          docker run -d --name proxy -p 8080:8080 llm-caching-proxy
+          sleep 2
+          docker logs proxy | grep "LLM caching proxy on :8080"
