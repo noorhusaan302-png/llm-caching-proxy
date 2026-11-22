@@ -1,80 +1,125 @@
-# LLM Caching Proxy & AI Inference Accelerator
+# LLM Caching Proxy
 
-A multithreaded HTTP proxy in C that sits between client applications and a local LLM backend (Ollama). It caches prompt/response pairs so repeated prompts are answered from memory instead of re-running the model.
+A drop-in cache for local LLMs, written in C. Point your app at the proxy instead of Ollama, and repeated requests come back from memory in under a millisecond instead of re-running the model.
 
-## Features
+No code changes: the proxy speaks the same API as your LLM server and returns its responses byte for byte.
 
-- **Inference middleware:** forwards client requests to a local LLM backend (Ollama on port `11434`) and caches the generated reply.
-- **Thread-safe LRU cache:** custom LRU eviction (capacity 100 entries) protected by a POSIX mutex, so concurrent client threads can read and write it safely.
-- **Redundant compute elimination:** an exact cache hit returns the stored response immediately with `"source": "cache"`, skipping the model entirely. A miss is forwarded upstream and tagged `"source": "ollama_upstream"`.
-- **Raw POSIX networking:** built on stream sockets, listening on port `8080`, one thread per client connection, with HTTP/JSON handling.
+```
+your app  ──►  proxy :8080  ──►  Ollama :11434
+                  │
+                  └── same request again? answered from memory
+```
+
+## Why
+
+Local models are slow, and apps repeat themselves: the same system prompt, the same test prompts during development, the same question from different users. Each repeat costs seconds of GPU time. This proxy remembers the answer.
 
 ## Results
 
 | Metric | Result | Setup |
 | :--- | :--- | :--- |
-| Cache hit latency | < 1 ms | Local |
-| 20 concurrent 1-second LLM calls | ~1 s total instead of ~20 s | Mock server |
-| 1,000 requests from 50 concurrent clients | 0 errors | Mock server |
+| Cache hit latency | about 0.5 ms (vs 1,000 ms for the model) | Mock server with a 1 s delay |
+| Cached throughput | about 5,000 requests/sec, 0 errors | 1,000 requests from 50 concurrent clients |
+| 20 concurrent 1-second LLM calls | about 1 s total instead of 20 s | Mock server |
 
-## Quick Start
+Reproduce with `python3 tests/benchmark.py --mock`.
 
-1. Start the LLM backend:
-```bash
-   ollama serve
-```
-2. Build and run the proxy:
-```bash
-   gcc -O2 -pthread -o proxy main.c
-   ./proxy
-```
-3. Send a prompt (`"stream": false` is required):
-```bash
-   curl -s http://localhost:8080/api/generate \
-     -d '{"model":"llama3","prompt":"What is a mutex?","stream":false}'
-```
-   Send the same command again. The reply returns in under 1 ms and includes `"source": "cache"`.
+## Quick start
 
-## Tests and Benchmark
+**1. Run the proxy**
+
+```bash
+gcc -O2 -pthread -o proxy main.c
+./proxy
+```
+
+Or with Docker:
+
+```bash
+docker build -t llm-caching-proxy .
+docker run -p 8080:8080 --add-host=host.docker.internal:host-gateway llm-caching-proxy
+```
+
+**2. Point your app at port 8080 instead of 11434**
+
+```bash
+curl http://localhost:8080/api/generate \
+  -d '{"model":"llama3","prompt":"What is a mutex?","stream":false}'
+```
+
+Run it twice. The second reply is instant and carries the header `X-Cache: HIT`.
+
+It works the same way with the OpenAI-style API:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="ollama")
+```
+
+## What gets cached
+
+| Request | Behavior |
+| :--- | :--- |
+| `POST /api/generate`, `/api/chat` (Ollama) | Cached |
+| `POST /v1/chat/completions`, `/v1/completions` (OpenAI-compatible) | Cached |
+| Everything else (`/api/tags`, `/api/pull`, ...) | Passed through, never cached |
+
+- **Cache key:** the path plus the exact request body. The model, prompt, messages and options all have to match, so the same prompt sent to two models gets two entries.
+- **Streaming works.** A streamed response is forwarded live as it arrives, recorded, and replayed on the next identical request.
+- **Only successful responses are cached.** Errors always go back to the model.
+- Every response has an `X-Cache` header: `HIT`, `MISS` or `BYPASS`.
+
+## Configuration
+
+Set with environment variables:
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `PROXY_PORT` | `8080` | Port the proxy listens on |
+| `UPSTREAM` | `127.0.0.1:11434` | Your LLM server, as `host:port` |
+| `CACHE_CAPACITY` | `100` | Number of responses kept; the least recently used is evicted |
+
+```bash
+UPSTREAM=127.0.0.1:1234 CACHE_CAPACITY=1000 ./proxy   # e.g. LM Studio on port 1234
+```
+
+## How it works
+
+- **Thread per connection.** Each client gets its own POSIX thread, so one slow model call doesn't block anyone else.
+- **LRU cache.** A doubly linked list keeps entries in order of use, and a hash table finds an entry in O(1). One mutex protects both.
+- **Raw sockets.** HTTP is parsed by hand on POSIX stream sockets, with no dependencies beyond libc.
+
+## Tests
 
 The tests run against a fake Ollama server (`tests/mock_ollama.py`), so no GPU or model is needed.
 
 ```bash
-# Hits, misses, JSON escaping, 400 errors, parallel misses, 1,000 requests from 50 clients, LRU eviction
-python3 tests/test_proxy.py
-
-# Benchmark against a real running Ollama
-python3 tests/benchmark.py
-
-# Benchmark against the mock server (isolates proxy overhead)
-python3 tests/benchmark.py --mock
+gcc -O2 -pthread -o proxy main.c
+python3 tests/test_proxy.py        # 14 integration tests
+python3 tests/benchmark.py --mock  # latency and throughput
 ```
 
-## Project Structure
-
-```text
-llm-caching-proxy/
-├── main.c               # Server entry point, worker threads, LRU cache, socket handling
-├── tests/
-│   ├── mock_ollama.py   # Fake Ollama server for testing
-│   ├── test_proxy.py    # Integration tests
-│   └── benchmark.py     # Concurrency and throughput benchmark
-└── README.md
-```
-
-## Design Notes
-
-- **Cache key:** entries are keyed by the exact prompt text.
-- **Deterministic replies:** because replies are cached, repeating a prompt returns the same answer until it is evicted, even if the model would normally vary its output.
+They cover hits and misses, byte-identical replay, streaming, the Ollama and OpenAI endpoints, pass-through, errors, LRU eviction, 20 parallel misses, and 1,000 requests from 50 clients. The suite also passes under AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer.
 
 ## Limitations
 
-- The cache key is the prompt only, so the same prompt sent to different models returns the same cached reply.
-- Prompts are limited to 1,023 characters; longer ones are truncated, so two long prompts with the same start would share a cache entry.
-- Cache lookup walks a doubly linked list (O(n)). That's fine for 100 entries; a hash map index would be needed for more.
-- Streaming responses (`"stream": true`) are not supported.
-- Each request is read with a single 8 KB `read()`, so very large requests may be cut off.
+- **Exact match only.** "What is a mutex?" and "what is a mutex" are different entries. There is no semantic matching.
+- **Cached answers repeat.** With a temperature above 0 you'd normally get a different answer each time; through the cache you get the first one until it's evicted.
+- **In memory only.** The cache is empty after a restart, and entries don't expire by time.
+- **HTTP only.** The upstream connection is plain HTTP, which fits local servers. It can't call HTTPS APIs directly.
+- **Size limits.** Request bodies up to 8 MB; responses up to 32 MB are cached, larger ones just pass through.
+- **A client that disconnects mid-stream** gets no cache entry for that request.
 
-## Tech Stack
+## Project structure
 
-C (POSIX), pthreads and mutexes, POSIX sockets, HTTP/1.1, Python 3 (tests), Ollama API, GCC/Clang.
+```text
+llm-caching-proxy/
+├── main.c               # Proxy, worker threads, LRU cache, HTTP handling
+├── Dockerfile
+├── tests/
+│   ├── mock_ollama.py   # Fake Ollama server for testing
+│   ├── client.py        # Tiny raw-socket HTTP client used by the tests
+│   ├── test_proxy.py    # Integration tests
+│   └── benchmark.py     # Latency and throughput benchmark
+└── README.md
+```

@@ -1,318 +1,390 @@
+// LLM Caching Proxy: a drop-in cache in front of Ollama (or any OpenAI-compatible server).
+// Point your app at this proxy instead of Ollama. Repeated requests are answered from
+// memory; everything else is passed through untouched.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #include <netdb.h>
 #include <signal.h>
 
-#define PROXY_PORT 8080
-#define OLLAMA_PORT 11434
-#define BUFFER_SIZE 8192
-#define CACHE_CAPACITY 100   // max prompt/response pairs kept in memory
+#define HEADER_MAX     16384             // max size of request headers
+#define BODY_MAX       (8 * 1024 * 1024) // max request body (8 MB)
+#define RESPONSE_MAX   (32 * 1024 * 1024)// max upstream response we will cache (32 MB)
+#define BUCKETS        4096              // hash table size for O(1) cache lookups
 
-// --- LRU CACHE STRUCTURES ---
+// ---------------- config (set with environment variables) ----------------
+static int  proxy_port = 8080;
+static char upstream_host[256] = "127.0.0.1";
+static char upstream_port[16]  = "11434";
+static int  cache_capacity = 100;
+
+// ---------------- LRU cache: doubly linked list + hash index ----------------
+// The list keeps recency order (head = newest). The hash table finds a key in O(1).
 typedef struct CacheNode {
-    char *prompt;
-    char *response;
-    struct CacheNode *prev;
-    struct CacheNode *next;
+    char *key;              // "PATH\nBODY": same request = same key
+    char *response;         // the full raw HTTP response from upstream
+    size_t response_len;
+    uint64_t hash;
+    struct CacheNode *prev, *next;   // LRU list
+    struct CacheNode *bucket_next;   // hash chain
 } CacheNode;
 
 typedef struct {
-    int capacity;
-    int size;
-    CacheNode *head;
-    CacheNode *tail;
+    int capacity, size;
+    CacheNode *head, *tail;
+    CacheNode *buckets[BUCKETS];
     pthread_mutex_t lock;
+    long hits, misses;
 } LRUCache;
 
-LRUCache lru_cache;
+static LRUCache cache;
 
-void init_cache(LRUCache *cache, int capacity) {
-    cache->capacity = capacity;
-    cache->size = 0;
-    cache->head = NULL;
-    cache->tail = NULL;
-    pthread_mutex_init(&cache->lock, NULL);
+static uint64_t fnv1a(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; }
+    return h;
 }
 
-char* cache_get(LRUCache *cache, const char *prompt) {
-    pthread_mutex_lock(&cache->lock);
-    CacheNode *curr = cache->head;
-    while (curr != NULL) {
-        if (strcmp(curr->prompt, prompt) == 0) {
-            if (curr != cache->head) {
-                if (curr->prev) curr->prev->next = curr->next;
-                if (curr->next) curr->next->prev = curr->prev;
-                if (curr == cache->tail) cache->tail = curr->prev;
+static void list_unlink(LRUCache *c, CacheNode *n) {
+    if (n->prev) n->prev->next = n->next; else c->head = n->next;
+    if (n->next) n->next->prev = n->prev; else c->tail = n->prev;
+    n->prev = n->next = NULL;
+}
 
-                curr->next = cache->head;
-                curr->prev = NULL;
-                cache->head->prev = curr;
-                cache->head = curr;
-            }
-            char *resp_copy = strdup(curr->response);
-            pthread_mutex_unlock(&cache->lock);
-            return resp_copy;
-        }
-        curr = curr->next;
-    }
-    pthread_mutex_unlock(&cache->lock);
+static void list_push_front(LRUCache *c, CacheNode *n) {
+    n->prev = NULL;
+    n->next = c->head;
+    if (c->head) c->head->prev = n;
+    c->head = n;
+    if (!c->tail) c->tail = n;
+}
+
+static CacheNode *bucket_find(LRUCache *c, const char *key, uint64_t h) {
+    for (CacheNode *n = c->buckets[h % BUCKETS]; n; n = n->bucket_next)
+        if (n->hash == h && strcmp(n->key, key) == 0) return n;
     return NULL;
 }
 
-void cache_put(LRUCache *cache, const char *prompt, const char *response) {
-    pthread_mutex_lock(&cache->lock);
-    CacheNode *curr = cache->head;
-    while (curr != NULL) {
-        if (strcmp(curr->prompt, prompt) == 0) {
-            free(curr->response);
-            curr->response = strdup(response);
-            pthread_mutex_unlock(&cache->lock);
-            return;
-        }
-        curr = curr->next;
-    }
+static void bucket_remove(LRUCache *c, CacheNode *target) {
+    CacheNode **pp = &c->buckets[target->hash % BUCKETS];
+    while (*pp && *pp != target) pp = &(*pp)->bucket_next;
+    if (*pp) *pp = target->bucket_next;
+}
 
-    CacheNode *new_node = (CacheNode *)malloc(sizeof(CacheNode));
-    new_node->prompt = strdup(prompt);
-    new_node->response = strdup(response);
-    new_node->prev = NULL;
-    new_node->next = NULL;
-
-    if (cache->size == 0) {
-        cache->head = new_node;
-        cache->tail = new_node;
-        cache->size++;
+// Returns a malloc'd copy of the cached response (caller frees), or NULL on a miss.
+static char *cache_get(LRUCache *c, const char *key, size_t *len_out) {
+    uint64_t h = fnv1a(key);
+    pthread_mutex_lock(&c->lock);
+    CacheNode *n = bucket_find(c, key, h);
+    char *copy = NULL;
+    if (n) {
+        list_unlink(c, n);            // move to front = most recently used
+        list_push_front(c, n);
+        copy = malloc(n->response_len);
+        if (copy) { memcpy(copy, n->response, n->response_len); *len_out = n->response_len; }
+        c->hits++;
     } else {
-        new_node->next = cache->head;
-        cache->head->prev = new_node;
-        cache->head = new_node;
-        cache->size++;
-
-        if (cache->size > cache->capacity) {
-            CacheNode *old_tail = cache->tail;
-            cache->tail = cache->tail->prev;
-            if (cache->tail) cache->tail->next = NULL;
-            free(old_tail->prompt);
-            free(old_tail->response);
-            free(old_tail);
-            cache->size--;
-        }
+        c->misses++;
     }
-    pthread_mutex_unlock(&cache->lock);
+    pthread_mutex_unlock(&c->lock);
+    return copy;
 }
 
-// --- JSON HELPERS ---
-void extract_prompt(const char *json_body, char *dest, size_t dest_size) {
-    char *p = strstr(json_body, "\"prompt\"");
-    if (!p) { strcpy(dest, ""); return; }
-    p = strchr(p, ':'); if (!p) { strcpy(dest, ""); return; }
-    p = strchr(p, '"'); if (!p) { strcpy(dest, ""); return; }
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < dest_size - 1) {
-        dest[i++] = *p++;
+static void cache_put(LRUCache *c, const char *key, const char *resp, size_t len) {
+    uint64_t h = fnv1a(key);
+    pthread_mutex_lock(&c->lock);
+    CacheNode *n = bucket_find(c, key, h);
+    if (n) {                          // already cached (two misses raced): just refresh it
+        list_unlink(c, n);
+        list_push_front(c, n);
+        pthread_mutex_unlock(&c->lock);
+        return;
     }
-    dest[i] = '\0';
+    n = calloc(1, sizeof(CacheNode));
+    if (!n) { pthread_mutex_unlock(&c->lock); return; }
+    n->key = strdup(key);
+    n->response = malloc(len);
+    if (!n->key || !n->response) { free(n->key); free(n->response); free(n); pthread_mutex_unlock(&c->lock); return; }
+    memcpy(n->response, resp, len);
+    n->response_len = len;
+    n->hash = h;
+    n->bucket_next = c->buckets[h % BUCKETS];
+    c->buckets[h % BUCKETS] = n;
+    list_push_front(c, n);
+    c->size++;
+
+    if (c->size > c->capacity) {      // evict the least recently used entry
+        CacheNode *old = c->tail;
+        list_unlink(c, old);
+        bucket_remove(c, old);
+        free(old->key); free(old->response); free(old);
+        c->size--;
+    }
+    pthread_mutex_unlock(&c->lock);
 }
 
-// Extract the "response" text from Ollama's JSON output
-void extract_ollama_response(const char *json_body, char *dest, size_t dest_size) {
-    char *p = strstr(json_body, "\"response\"");
-    if (!p) { 
-        strncpy(dest, json_body, dest_size); 
-        return; 
+// ---------------- small helpers ----------------
+static int write_all(int fd, const char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n <= 0) return -1;
+        buf += n; len -= (size_t)n;
     }
-    p = strchr(p, ':'); if (!p) { strcpy(dest, ""); return; }
-    p = strchr(p, '"'); if (!p) { strcpy(dest, ""); return; }
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < dest_size - 1) {
-        // (an escaped quote \" is handled below, so it doesn't end the string)
-        // Handle JSON escapes: \n becomes a space, \" and \\ become the plain character
-        if (*p == '\\' && *(p+1) == 'n') {
-            dest[i++] = ' ';
-            p += 2;
-        } else if (*p == '\\' && *(p+1) != '\0') {
-            dest[i++] = *(p+1);
-            p += 2;
-        } else {
-            dest[i++] = *p++;
-        }
-    }
-    dest[i] = '\0';
-}
-
-// Forward request to local Ollama instance and get response
-int forward_to_ollama(const char *raw_request, char *response_dest, size_t dest_size) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(OLLAMA_PORT);
-    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-
-    write(sock, raw_request, strlen(raw_request));
-
-    char ollama_buffer[BUFFER_SIZE * 4];
-    memset(ollama_buffer, 0, sizeof(ollama_buffer));
-    // Keep reading until Ollama closes the connection (a big answer can arrive in pieces)
-    size_t total = 0;
-    ssize_t n;
-    while (total < sizeof(ollama_buffer) - 1 &&
-           (n = read(sock, ollama_buffer + total, sizeof(ollama_buffer) - 1 - total)) > 0) {
-        total += n;
-    }
-    close(sock);
-
-    if (total == 0) return -1;
-
-    // Separate HTTP body from Ollama's response headers
-    char *body = strstr(ollama_buffer, "\r\n\r\n");
-    body = body ? body + 4 : ollama_buffer;
-
-    extract_ollama_response(body, response_dest, dest_size);
     return 0;
 }
 
-// Escape quotes and backslashes so the text is safe to put inside a JSON string
-void json_escape(const char *src, char *dest, size_t dest_size) {
-    size_t i = 0;
-    for (; *src && i + 2 < dest_size; src++) {
-        if (*src == '"' || *src == '\\') dest[i++] = '\\';
-        dest[i++] = *src;
-    }
-    dest[i] = '\0';
+static void send_error(int fd, const char *status, const char *msg) {
+    char out[512];
+    int body_len = snprintf(NULL, 0, "{\"error\": \"%s\"}", msg);
+    snprintf(out, sizeof(out),
+        "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n{\"error\": \"%s\"}",
+        status, body_len, msg);
+    write_all(fd, out, strlen(out));
 }
 
-void handle_client(int client_socket) {
-    char buffer[BUFFER_SIZE];
-    memset(buffer, 0, BUFFER_SIZE);
+// Case-insensitive header lookup. Copies the value into dest. Returns 1 if found.
+static int get_header(const char *headers, const char *name, char *dest, size_t dest_size) {
+    size_t name_len = strlen(name);
+    const char *line = strstr(headers, "\r\n");
+    while (line && line[2] != '\r') {
+        line += 2;
+        if (strncasecmp(line, name, name_len) == 0 && line[name_len] == ':') {
+            const char *v = line + name_len + 1;
+            while (*v == ' ') v++;
+            size_t i = 0;
+            while (v[i] && v[i] != '\r' && i < dest_size - 1) { dest[i] = v[i]; i++; }
+            dest[i] = '\0';
+            return 1;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return 0;
+}
 
-    ssize_t bytes_read = read(client_socket, buffer, BUFFER_SIZE - 1);
-    if (bytes_read < 0) {
-        close(client_socket);
-        return;
+// Only generation requests are worth caching. Everything else (model lists, pulls...) passes through.
+static int is_cacheable(const char *method, const char *path) {
+    if (strcmp(method, "POST") != 0) return 0;
+    return strcmp(path, "/api/generate") == 0 || strcmp(path, "/api/chat") == 0 ||
+           strcmp(path, "/v1/chat/completions") == 0 || strcmp(path, "/v1/completions") == 0;
+}
+
+static int connect_upstream(void) {
+    struct addrinfo hints = {0}, *res, *rp;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(upstream_host, upstream_port, &hints, &res) != 0) return -1;
+    int sock = -1;
+    for (rp = res; rp; rp = rp->ai_next) {
+        sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) continue;
+        if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sock); sock = -1;
+    }
+    freeaddrinfo(res);
+    return sock;
+}
+
+// ---------------- request handling ----------------
+static void handle_client(int client) {
+    // 1. Read until the end of the headers.
+    char head[HEADER_MAX + 1];
+    size_t got = 0;
+    char *end_of_headers = NULL;
+    while (got < HEADER_MAX) {
+        ssize_t n = read(client, head + got, HEADER_MAX - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+        head[got] = '\0';
+        if ((end_of_headers = strstr(head, "\r\n\r\n"))) break;
+    }
+    if (!end_of_headers) { send_error(client, "400 Bad Request", "Malformed request"); return; }
+    size_t header_len = (size_t)(end_of_headers - head) + 4;
+
+    char method[16] = {0}, path[2048] = {0};
+    if (sscanf(head, "%15s %2047s", method, path) != 2) {
+        send_error(client, "400 Bad Request", "Malformed request line"); return;
     }
 
-    char *body = strstr(buffer, "\r\n\r\n");
-    body = body ? body + 4 : "";
+    // 2. Read the whole body using Content-Length (the old version did a single 8 KB read).
+    char cl[32] = "0";
+    get_header(head, "Content-Length", cl, sizeof(cl));
+    long body_len = strtol(cl, NULL, 10);
+    if (body_len < 0 || body_len > BODY_MAX) { send_error(client, "413 Payload Too Large", "Request body too large"); return; }
 
-    char prompt_buffer[1024];
-    extract_prompt(body, prompt_buffer, sizeof(prompt_buffer));
+    char *body = malloc((size_t)body_len + 1);
+    if (!body) { send_error(client, "500 Internal Server Error", "Out of memory"); return; }
+    size_t have = got - header_len;
+    if (have > (size_t)body_len) have = (size_t)body_len;
+    memcpy(body, head + header_len, have);
+    while (have < (size_t)body_len) {
+        ssize_t n = read(client, body + have, (size_t)body_len - have);
+        if (n <= 0) break;
+        have += (size_t)n;
+    }
+    body[have] = '\0';
+    if (have < (size_t)body_len) { free(body); send_error(client, "400 Bad Request", "Incomplete body"); return; }
 
-    if (strlen(prompt_buffer) == 0) {
-        const char *err_resp = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\": \"No prompt found\"}";
-        write(client_socket, err_resp, strlen(err_resp));
-        close(client_socket);
-        return;
+    // 3. Cache lookup. The key is the path plus the exact body, so the model, prompt,
+    //    messages and options all have to match. Different model = different entry.
+    int cacheable = is_cacheable(method, path);
+    char *key = NULL;
+    if (cacheable) {
+        key = malloc(strlen(path) + 1 + (size_t)body_len + 1);
+        if (key) sprintf(key, "%s\n%s", path, body);
+        else cacheable = 0;
     }
 
-    printf("\n[Request] Prompt: \"%s\"\n", prompt_buffer);
-
-    char *cached_response = cache_get(&lru_cache, prompt_buffer);
-    char final_response_buffer[BUFFER_SIZE * 2];
-
-    if (cached_response != NULL) {
-        printf(" -> CACHE HIT! Serving instant response from memory.\n");
-        char escaped[BUFFER_SIZE];
-        json_escape(cached_response, escaped, sizeof(escaped));
-        snprintf(final_response_buffer, sizeof(final_response_buffer),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"source\": \"cache\", \"response\": \"%s\"}",
-            escaped);
-        free(cached_response);
-    } else {
-        printf(" -> CACHE MISS. Forwarding upstream to Ollama...\n");
-        
-        char ollama_answer[2048];
-        if (forward_to_ollama(buffer, ollama_answer, sizeof(ollama_answer)) != 0) {
-            const char *err_resp = "HTTP/1.1 502 Bad Gateway\r\n\r\n{\"error\": \"Failed to reach Ollama. Is 'ollama serve' running?\"}";
-            write(client_socket, err_resp, strlen(err_resp));
-            close(client_socket);
+    if (cacheable) {
+        size_t cached_len = 0;
+        char *cached = cache_get(&cache, key, &cached_len);
+        if (cached) {
+            // Replay the exact upstream response, adding an X-Cache header after the status line.
+            char *eol = memchr(cached, '\n', cached_len);
+            size_t first_line = eol ? (size_t)(eol - cached) + 1 : 0;
+            write_all(client, cached, first_line);
+            write_all(client, "X-Cache: HIT\r\n", 14);
+            write_all(client, cached + first_line, cached_len - first_line);
+            printf("[HIT ] %s %s\n", method, path);
+            free(cached); free(key); free(body);
             return;
         }
-
-        // Save real AI response into cache
-        cache_put(&lru_cache, prompt_buffer, ollama_answer);
-
-        char escaped[BUFFER_SIZE];
-        json_escape(ollama_answer, escaped, sizeof(escaped));
-        snprintf(final_response_buffer, sizeof(final_response_buffer),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"source\": \"ollama_upstream\", \"response\": \"%s\"}",
-            escaped);
     }
 
-    write(client_socket, final_response_buffer, strlen(final_response_buffer));
-    close(client_socket);
+    // 4. Miss (or not cacheable): forward to upstream. We rebuild the headers so the
+    //    upstream closes the connection when done, which tells us the response is complete.
+    int up = connect_upstream();
+    if (up < 0) {
+        send_error(client, "502 Bad Gateway", "Failed to reach the LLM server. Is it running?");
+        free(key); free(body); return;
+    }
+    char ctype[128] = "application/json", auth[1024] = "";
+    get_header(head, "Content-Type", ctype, sizeof(ctype));
+    int has_auth = get_header(head, "Authorization", auth, sizeof(auth));
+    char req_head[4096];
+    int rh = snprintf(req_head, sizeof(req_head),
+        "%s %s HTTP/1.1\r\nHost: %s:%s\r\nContent-Type: %s\r\nContent-Length: %ld\r\n%s%s%sConnection: close\r\n\r\n",
+        method, path, upstream_host, upstream_port, ctype, body_len,
+        has_auth ? "Authorization: " : "", has_auth ? auth : "", has_auth ? "\r\n" : "");
+    if (write_all(up, req_head, (size_t)rh) < 0 || write_all(up, body, (size_t)body_len) < 0) {
+        close(up); send_error(client, "502 Bad Gateway", "Upstream write failed");
+        free(key); free(body); return;
+    }
+
+    // 5. Stream the response to the client as it arrives (so streaming still feels live)
+    //    while also recording it, so it can be cached once it's complete.
+    char *record = NULL;
+    size_t rec_len = 0, rec_cap = 0;
+    int recording = cacheable, header_injected = 0, client_gone = 0;
+    char chunk[16384];
+    ssize_t n;
+    while ((n = read(up, chunk, sizeof(chunk))) > 0) {
+        if (recording) {
+            if (rec_len + (size_t)n > RESPONSE_MAX) { recording = 0; free(record); record = NULL; }
+            else {
+                if (rec_len + (size_t)n > rec_cap) {
+                    rec_cap = (rec_len + (size_t)n) * 2;
+                    char *grown = realloc(record, rec_cap);
+                    if (!grown) { recording = 0; free(record); record = NULL; }
+                    else record = grown;
+                }
+                if (recording) { memcpy(record + rec_len, chunk, (size_t)n); rec_len += (size_t)n; }
+            }
+        }
+        // Add "X-Cache: MISS" right after the status line on the first chunk.
+        if (!header_injected) {
+            char *eol = memchr(chunk, '\n', (size_t)n);
+            if (eol) {
+                size_t first_line = (size_t)(eol - chunk) + 1;
+                write_all(client, chunk, first_line);
+                write_all(client, cacheable ? "X-Cache: MISS\r\n" : "X-Cache: BYPASS\r\n", cacheable ? 15 : 17);
+                if (write_all(client, chunk + first_line, (size_t)n - first_line) < 0) { client_gone = 1; break; }
+                header_injected = 1;
+                continue;
+            }
+        }
+        if (write_all(client, chunk, (size_t)n) < 0) { client_gone = 1; break; }   // client went away
+    }
+    close(up);
+    if (!header_injected) {   // upstream accepted the connection but sent nothing back
+        send_error(client, "502 Bad Gateway", "Empty response from the LLM server");
+        free(record); free(key); free(body); return;
+    }
+
+    // 6. Only cache complete, successful responses (a half-sent stream must never be cached).
+    if (!client_gone && recording && record && rec_len > 12 && strncmp(record + 9, "200", 3) == 0) {
+        cache_put(&cache, key, record, rec_len);
+        printf("[MISS] %s %s (cached %zu bytes)\n", method, path, rec_len);
+    } else {
+        printf("[PASS] %s %s\n", method, path);
+    }
+    free(record); free(key); free(body);
 }
 
-// Each client gets its own thread, so a slow LLM call doesn't block other users
-void *client_thread(void *arg) {
-    int client_socket = *(int *)arg;
+static void *client_thread(void *arg) {
+    int client = *(int *)arg;
     free(arg);
-    handle_client(client_socket);
+    handle_client(client);
+    close(client);
     return NULL;
 }
 
-int main() {
-    signal(SIGPIPE, SIG_IGN);   // don't crash if a client disconnects early
-    init_cache(&lru_cache, CACHE_CAPACITY);
-
-    int server_fd, client_socket;
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
-
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("Socket failed");
-        exit(EXIT_FAILURE);
+static void load_config(void) {
+    const char *v;
+    if ((v = getenv("PROXY_PORT"))) proxy_port = atoi(v);
+    if ((v = getenv("CACHE_CAPACITY")) && atoi(v) > 0) cache_capacity = atoi(v);
+    // UPSTREAM can be "host:port", e.g. "127.0.0.1:11434" or "host.docker.internal:11434"
+    if ((v = getenv("UPSTREAM"))) {
+        const char *colon = strrchr(v, ':');
+        if (colon) {
+            size_t hl = (size_t)(colon - v);
+            if (hl >= sizeof(upstream_host)) hl = sizeof(upstream_host) - 1;
+            memcpy(upstream_host, v, hl); upstream_host[hl] = '\0';
+            snprintf(upstream_port, sizeof(upstream_port), "%s", colon + 1);
+        } else {
+            snprintf(upstream_host, sizeof(upstream_host), "%s", v);
+        }
     }
+}
 
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);           // don't crash if a client disconnects early
+    setvbuf(stdout, NULL, _IOLBF, 0);   // log lines show up immediately (useful in Docker)
+    load_config();
+    memset(&cache, 0, sizeof(cache));
+    cache.capacity = cache_capacity;
+    pthread_mutex_init(&cache.lock, NULL);
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PROXY_PORT);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)proxy_port);
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    if (listen(server_fd, 128) < 0) { perror("listen"); return 1; }
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_fd, 128) < 0) {
-        perror("Listen failed");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("LLM Token-Caching Proxy running on port %d, linked to Ollama on port %d...\n", PROXY_PORT, OLLAMA_PORT);
+    printf("LLM caching proxy on :%d -> upstream %s:%s (cache capacity %d)\n",
+           proxy_port, upstream_host, upstream_port, cache_capacity);
 
     while (1) {
-        if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            continue;
-        }
-        int *sock_ptr = malloc(sizeof(int));
-        if (!sock_ptr) { close(client_socket); continue; }
-        *sock_ptr = client_socket;
-
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) continue;
+        int *arg = malloc(sizeof(int));
+        if (!arg) { close(client); continue; }
+        *arg = client;
         pthread_t tid;
-        if (pthread_create(&tid, NULL, client_thread, sock_ptr) != 0) {
-            close(client_socket);
-            free(sock_ptr);
-            continue;
-        }
+        if (pthread_create(&tid, NULL, client_thread, arg) != 0) { close(client); free(arg); continue; }
         pthread_detach(tid);   // thread cleans itself up when done
     }
-
-    return 0;
 }
