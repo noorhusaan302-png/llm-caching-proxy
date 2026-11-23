@@ -10,6 +10,32 @@ your app  ──►  proxy :8080  ──►  Ollama :11434
                   └── same request again? answered from memory
 ```
 
+## Try it in 2 minutes
+
+You need [Ollama](https://ollama.com) running with any model, and a Mac or Linux terminal.
+
+1. Download and build the proxy:
+
+   ```bash
+   git clone https://github.com/noorhusaan302-png/llm-caching-proxy.git
+   cd llm-caching-proxy
+   gcc -O2 -pthread -o proxy main.c
+   ./proxy
+   ```
+
+2. In a second terminal, send the same prompt twice (swap in a model you have, e.g. `llama3.2`):
+
+   ```bash
+   curl -i http://localhost:8080/api/generate \
+     -d '{"model":"llama3.2","prompt":"What is a mutex?","stream":false}'
+   ```
+
+3. The first reply says `X-Cache: MISS` and takes as long as the model. The second says `X-Cache: HIT` and comes back instantly.
+
+To use it in your own app, change the port from `11434` to `8080`. Nothing else changes.
+
+Questions or bugs? [Open an issue](https://github.com/noorhusaan302-png/llm-caching-proxy/issues).
+
 ## Why
 
 Local models are slow, and apps repeat themselves: the same system prompt, the same test prompts during development, the same question from different users. Each repeat costs seconds of GPU time. This proxy remembers the answer.
@@ -44,7 +70,7 @@ docker run -p 8080:8080 --add-host=host.docker.internal:host-gateway llm-caching
 
 ```bash
 curl http://localhost:8080/api/generate \
-  -d '{"model":"llama3","prompt":"What is a mutex?","stream":false}'
+  -d '{"model":"llama3.2","prompt":"What is a mutex?","stream":false}'
 ```
 
 Run it twice. The second reply is instant and carries the header `X-Cache: HIT`.
