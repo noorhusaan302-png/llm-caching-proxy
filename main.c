@@ -176,6 +176,101 @@ static int is_cacheable(const char *method, const char *path) {
            strcmp(path, "/v1/chat/completions") == 0 || strcmp(path, "/v1/completions") == 0;
 }
 
+// Does the last non-empty NDJSON line say "done": true? (Ollama's end-of-stream marker.)
+static int ndjson_done(const char *body, size_t len) {
+    while (len > 0 && (body[len - 1] == '\n' || body[len - 1] == '\r' || body[len - 1] == ' ')) len--;
+    if (len == 0) return 0;
+    size_t start = len;
+    while (start > 0 && body[start - 1] != '\n') start--;
+    const char *line = body + start;
+    size_t line_len = len - start;
+    for (size_t i = 0; i + 6 <= line_len; i++) {
+        if (memcmp(line + i, "\"done\"", 6) != 0) continue;
+        size_t j = i + 6;
+        while (j < line_len && (line[j] == ' ' || line[j] == ':')) j++;
+        return j + 4 <= line_len && memcmp(line + j, "true", 4) == 0;
+    }
+    return 0;
+}
+
+static int contains(const char *hay, size_t len, const char *needle) {
+    size_t n = strlen(needle);
+    for (size_t i = 0; i + n <= len; i++) if (memcmp(hay + i, needle, n) == 0) return 1;
+    return 0;
+}
+
+// Decodes a chunked body into `out` (caller frees). Returns 1 only if the final 0-size chunk was
+// reached, i.e. the upstream really finished sending. Returns 0 for a cut-off or malformed body.
+static int dechunk(const char *p, size_t len, char **out, size_t *out_len) {
+    char *buf = malloc(len + 1);
+    if (!buf) return 0;
+    size_t pos = 0, w = 0;
+    for (;;) {
+        size_t line_end = pos;
+        while (line_end + 1 < len && !(p[line_end] == '\r' && p[line_end + 1] == '\n')) line_end++;
+        if (line_end + 1 >= len) break;                       // size line never finished
+        char *endp;
+        unsigned long size = strtoul(p + pos, &endp, 16);
+        if (endp == p + pos) break;                           // not a hex size
+        pos = line_end + 2;
+        if (size == 0) { *out = buf; *out_len = w; return 1; } // final chunk: body is complete
+        if (pos + size + 2 > len) break;                      // chunk data was cut off
+        memcpy(buf + w, p + pos, size);
+        w += size;
+        pos += size + 2;                                      // skip data and its CRLF
+    }
+    free(buf);
+    return 0;
+}
+
+// Only a response we can prove is finished may be cached. A 200 status line alone is not enough:
+// the upstream can send headers and then drop the connection halfway through the body.
+static int response_complete(const char *resp, size_t len) {
+    const char *hdr_end = NULL;
+    for (size_t i = 0; i + 4 <= len; i++)
+        if (memcmp(resp + i, "\r\n\r\n", 4) == 0) { hdr_end = resp + i; break; }
+    if (!hdr_end) return 0;
+    size_t head_len = (size_t)(hdr_end - resp) + 4;
+    char head[HEADER_MAX];
+    if (head_len >= sizeof(head)) return 0;
+    memcpy(head, resp, head_len);
+    head[head_len] = '\0';
+    const char *body = resp + head_len;
+    size_t body_len = len - head_len;
+
+    char ctype[128] = "", te[64] = "", cl[32] = "";
+    get_header(head, "Content-Type", ctype, sizeof(ctype));
+    int is_ndjson = strstr(ctype, "ndjson") != NULL;
+    int is_sse = strstr(ctype, "event-stream") != NULL;
+
+    char *decoded = NULL;
+    size_t decoded_len = 0;
+    int ok;
+    if (get_header(head, "Transfer-Encoding", te, sizeof(te)) && strstr(te, "chunked")) {
+        if (!dechunk(body, body_len, &decoded, &decoded_len)) return 0;  // final chunk missing
+        body = decoded; body_len = decoded_len;
+        ok = 1;
+    } else if (get_header(head, "Content-Length", cl, sizeof(cl))) {
+        char *endp;
+        unsigned long want = strtoul(cl, &endp, 10);
+        ok = endp != cl && body_len == want;                  // every promised byte arrived
+    } else {
+        // No framing, the body just ends when the connection closes. A cut-off stream is caught by
+        // the marker checks below; for plain JSON, at least require the document to be closed.
+        ok = body_len > 0;
+        if (ok && !is_ndjson && !is_sse && strstr(ctype, "json")) {
+            size_t e = body_len;
+            while (e > 0 && (body[e - 1] == '\n' || body[e - 1] == '\r' || body[e - 1] == ' ')) e--;
+            ok = e > 0 && (body[e - 1] == '}' || body[e - 1] == ']');
+        }
+    }
+    // A stream also has to reach its own end marker, not just a closed socket.
+    if (ok && is_ndjson) ok = ndjson_done(body, body_len);
+    if (ok && is_sse) ok = contains(body, body_len, "data: [DONE]");
+    free(decoded);
+    return ok;
+}
+
 static int connect_upstream(void) {
     struct addrinfo hints = {0}, *res, *rp;
     hints.ai_family = AF_UNSPEC;
@@ -312,14 +407,18 @@ static void handle_client(int client) {
         }
         if (write_all(client, chunk, (size_t)n) < 0) { client_gone = 1; break; }   // client went away
     }
+    int upstream_failed = (n < 0);    // read error from upstream: the response is not trustworthy
     close(up);
     if (!header_injected) {   // upstream accepted the connection but sent nothing back
         send_error(client, "502 Bad Gateway", "Empty response from the LLM server");
         free(record); free(key); free(body); return;
     }
 
-    // 6. Only cache complete, successful responses (a half-sent stream must never be cached).
-    if (!client_gone && recording && record && rec_len > 12 && strncmp(record + 9, "200", 3) == 0) {
+    // 6. Only cache complete, successful responses. Checking the 200 status is not enough: the
+    //    upstream may send headers and then disconnect mid-body, so we also check the body really
+    //    finished (Content-Length, the final chunk, or the stream's own end marker).
+    if (!client_gone && !upstream_failed && recording && record && rec_len > 12 &&
+        strncmp(record + 9, "200", 3) == 0 && response_complete(record, rec_len)) {
         cache_put(&cache, key, record, rec_len);
         printf("[MISS] %s %s (cached %zu bytes)\n", method, path, rec_len);
     } else {
