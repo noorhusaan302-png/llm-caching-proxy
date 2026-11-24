@@ -84,6 +84,32 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(h["x-cache"], "BYPASS")
         self.assertIn("llama3", text)
 
+    # --- partial responses must never be cached (reported on r/ollama) ---
+    def _assert_not_cached(self, prompt, stream):
+        payload = {"model": "llama3", "prompt": prompt, "stream": stream}
+        before = self.ollama.calls
+        _, s1, h1, _ = request("/api/generate", payload)
+        _, s2, h2, _ = request("/api/generate", payload)
+        self.assertIn("200", s1)
+        self.assertEqual((h1["x-cache"], h2["x-cache"]), ("MISS", "MISS"))
+        self.assertEqual(self.ollama.calls - before, 2)   # second request reached upstream again
+
+    def test_body_cut_short_of_content_length_is_not_cached(self):
+        self._assert_not_cached("__cut_content_length__", False)
+
+    def test_stream_without_done_marker_is_not_cached(self):
+        self._assert_not_cached("__cut_stream__", True)
+
+    def test_chunked_stream_missing_final_chunk_is_not_cached(self):
+        self._assert_not_cached("__cut_chunked__", True)
+
+    def test_complete_chunked_stream_is_cached(self):
+        payload = {"model": "llama3", "prompt": "__chunked_ok__"}
+        _, _, h1, t1 = request("/api/generate", payload)
+        _, _, h2, t2 = request("/api/generate", payload)
+        self.assertEqual((h1["x-cache"], h2["x-cache"]), ("MISS", "HIT"))
+        self.assertEqual(t1, t2)
+
     def test_errors_are_not_cached(self):
         before = self.ollama.calls
         request("/api/fail", {"x": 1})

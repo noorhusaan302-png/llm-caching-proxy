@@ -29,6 +29,9 @@ class MockOllama:
                 mock.calls += 1
                 time.sleep(mock.delay)  # pretend the model is thinking
                 model = body.get("model", "mock")
+                prompt = body.get("prompt", "")
+                if self.path == "/api/generate" and prompt.startswith("__"):
+                    return self._broken(prompt, model)
                 if self.path == "/api/generate":
                     answer = f'[{model}] He said "hi" to ' + body.get("prompt", "")
                     if body.get("stream", True):        # Ollama streams by default (NDJSON)
@@ -52,6 +55,34 @@ class MockOllama:
                     self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers()
                 else:
                     self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+
+            def _broken(self, prompt, model):
+                """Upstreams that send 200 and then fail partway. The proxy must not cache these."""
+                line = lambda done: (json.dumps({"model": model, "response": "word ", "done": done}) + "\n").encode()
+                def chunk(data):
+                    return f"{len(data):x}\r\n".encode() + data + b"\r\n"
+                self.send_response(200)
+                if prompt == "__cut_content_length__":       # promises 200 bytes, sends 100, hangs up
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "200")
+                    self.end_headers()
+                    self.wfile.write(b'{"model": "' + model.encode() + b'", "response": "' + b"x" * 60 + b'"')
+                elif prompt == "__cut_stream__":             # NDJSON stream that never sends done: true
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.end_headers()
+                    self.wfile.write(line(False) + line(False))
+                elif prompt == "__cut_chunked__":            # chunked stream missing the final 0 chunk
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(chunk(line(False)) + chunk(line(False)))
+                elif prompt == "__chunked_ok__":             # a complete chunked stream (should be cached)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(chunk(line(False)) + chunk(line(True)) + b"0\r\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
 
             def log_message(self, *args):
                 pass
